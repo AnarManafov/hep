@@ -5,6 +5,7 @@
 package xrootd // import "go-hep.org/x/hep/xrootd"
 
 import (
+	"crypto/tls"
 	"context"
 	"fmt"
 	"os"
@@ -30,6 +31,7 @@ type Client struct {
 	sessions         map[string]*cliSession
 
 	maxRedirections int
+	tlsConfig       *tls.Config // TLS configuration for secure connections
 }
 
 // Option configures an XRootD client.
@@ -41,6 +43,15 @@ type Option func(*Client) error
 func WithAuth(a auth.Auther) Option {
 	return func(client *Client) error {
 		return client.addAuth(a)
+	}
+}
+
+// WithTLS configures the client to use TLS for connections.
+// This is required for ZTN (Zero-Trust Networking) protocol support.
+func WithTLS(config *tls.Config) Option {
+	return func(c *Client) error {
+		c.tlsConfig = config
+		return nil
 	}
 }
 

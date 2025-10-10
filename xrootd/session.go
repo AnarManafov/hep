@@ -6,9 +6,13 @@ package xrootd // import "go-hep.org/x/hep/xrootd"
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,9 +83,27 @@ type pendingRequest struct {
 func newSession(ctx context.Context, address, username, token string, client *Client) (*cliSession, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	var d net.Dialer
 	addr := parseAddr(address)
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	
+	// Discover token from environment if TLS is configured and token is empty
+	if token == "" && client.tlsConfig != nil {
+		token = discoverZTNToken()
+	}
+	
+	// Create connection with TLS if configured, otherwise plain TCP
+	var conn net.Conn
+	var err error
+	if client.tlsConfig != nil {
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{},
+			Config:    client.tlsConfig,
+		}
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	} else {
+		var d net.Dialer
+		conn, err = d.DialContext(ctx, "tcp", addr)
+	}
+	
 	if err != nil {
 		cancel()
 		return nil, err
@@ -483,4 +505,46 @@ func newSubSession(ctx context.Context, parent *cliSession) (*cliSession, error)
 
 	sess.pathID = pathID
 	return sess, nil
+}
+
+// discoverZTNToken discovers the ZTN bearer token from environment variables and files
+// following the ZTN protocol specification.
+// It checks in this order:
+// 1. BEARER_TOKEN environment variable
+// 2. BEARER_TOKEN_FILE environment variable (reads token from file)
+// 3. $XDG_RUNTIME_DIR/bt_u<euid> file
+// 4. /tmp/bt_u<euid> file
+// Returns empty string if no token is found.
+func discoverZTNToken() string {
+	// 1. Check BEARER_TOKEN environment variable
+	if token := os.Getenv("BEARER_TOKEN"); token != "" {
+		return strings.TrimSpace(token)
+	}
+
+	// 2. Check BEARER_TOKEN_FILE environment variable
+	if tokenFile := os.Getenv("BEARER_TOKEN_FILE"); tokenFile != "" {
+		if data, err := os.ReadFile(tokenFile); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+
+	// Get effective user ID for file-based token discovery
+	euid := os.Geteuid()
+	tokenFileName := "bt_u" + strconv.Itoa(euid)
+
+	// 3. Check $XDG_RUNTIME_DIR/bt_u<euid>
+	if xdgDir := os.Getenv("XDG_RUNTIME_DIR"); xdgDir != "" {
+		tokenPath := filepath.Join(xdgDir, tokenFileName)
+		if data, err := os.ReadFile(tokenPath); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+
+	// 4. Check /tmp/bt_u<euid>
+	tokenPath := filepath.Join("/tmp", tokenFileName)
+	if data, err := os.ReadFile(tokenPath); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+
+	return ""
 }
