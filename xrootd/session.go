@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -99,9 +100,15 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 			Config:    client.tlsConfig,
 		}
 		conn, err = dialer.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			log.Printf("XRootD: Established TLS/ZTN connection to %s (token present: %v)", addr, token != "")
+		}
 	} else {
 		var d net.Dialer
 		conn, err = d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			log.Printf("XRootD: Established plain TCP connection to %s (no TLS/ZTN)", addr)
+		}
 	}
 	
 	if err != nil {
