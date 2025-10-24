@@ -91,30 +91,17 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		token = discoverZTNToken()
 	}
 	
-	// Create connection with TLS if configured, otherwise plain TCP
-	var conn net.Conn
-	var err error
-	if client.tlsConfig != nil {
-		dialer := &tls.Dialer{
-			NetDialer: &net.Dialer{},
-			Config:    client.tlsConfig,
-		}
-		conn, err = dialer.DialContext(ctx, "tcp", addr)
-		if err == nil {
-			log.Printf("XRootD: Established TLS/ZTN connection to %s (token present: %v)", addr, token != "")
-		}
-	} else {
-		var d net.Dialer
-		conn, err = d.DialContext(ctx, "tcp", addr)
-		if err == nil {
-			log.Printf("XRootD: Established plain TCP connection to %s (no TLS/ZTN)", addr)
-		}
-	}
-	
+	// ALWAYS start with plain TCP connection
+	// TLS will be upgraded after protocol negotiation (XRootD protocol requirement)
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
+	
+	log.Printf("XRootD: Connected to %s (TLS enabled: %v, token present: %v)", 
+		addr, client.tlsConfig != nil, token != "")
 
 	sess := &cliSession{
 		ctx:       ctx,
@@ -132,11 +119,43 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 
 	go sess.consume()
 
+	// Step 1: Initial handshake over plain TCP
 	if err := sess.handshake(ctx); err != nil {
 		sess.Close()
 		return nil, err
 	}
 
+	// Step 2: Protocol negotiation - request security requirements
+	// This tells server we want/can use TLS for ZTN
+	protocolInfo, err := sess.Protocol(ctx)
+	if err != nil {
+		sess.Close()
+		return nil, err
+	}
+
+	// Step 3: Upgrade to TLS if client wants ZTN and server requires/supports it
+	if client.tlsConfig != nil {
+		// Check if we need to upgrade to TLS for security protocols
+		// ZTN protocol REQUIRES TLS per specification
+		if token != "" || protocolInfo.HasSecurityInfo {
+			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
+			
+			// Wrap existing connection with TLS
+			tlsConn := tls.Client(conn, client.tlsConfig)
+			
+			// Perform TLS handshake
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				sess.Close()
+				return nil, fmt.Errorf("xrootd: TLS handshake failed: %w", err)
+			}
+			
+			// Replace plain connection with TLS connection
+			sess.conn = tlsConn
+			log.Printf("XRootD: TLS upgrade successful, connection encrypted")
+		}
+	}
+
+	// Step 4: Login (now over TLS if upgraded)
 	securityInfo, err := sess.Login(ctx, username, token)
 	if err != nil {
 		sess.Close()
@@ -145,18 +164,13 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 
 	sess.loginID = securityInfo.SessionID
 
+	// Step 5: Authentication if required (over TLS)
 	if len(securityInfo.SecurityInformation) > 0 {
 		err = sess.auth(ctx, securityInfo.SecurityInformation)
 		if err != nil {
 			sess.Close()
 			return nil, err
 		}
-	}
-
-	protocolInfo, err := sess.Protocol(ctx)
-	if err != nil {
-		sess.Close()
-		return nil, err
 	}
 
 	sess.signRequirements = signing.New(protocolInfo.SecurityLevel, protocolInfo.SecurityOverrides)
