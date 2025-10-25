@@ -264,7 +264,9 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 	// Step 4: Login (now over TLS if upgraded)
 	// Note: If TLS was enabled, consume() is still paused at this point.
 	// The Login request will trigger the TLS handshake on write, then resume consume().
+	log.Printf("XRootD: About to call Login()")
 	securityInfo, err := sess.Login(ctx, username, token)
+	log.Printf("XRootD: Login() returned, err=%v", err)
 	if err != nil {
 		sess.Close()
 		return nil, err
@@ -475,9 +477,12 @@ func (sess *cliSession) writeRequest(request pendingRequest) error {
 	conn := sess.conn
 	sess.connMu.RUnlock()
 
+	log.Printf("XRootD: writeRequest() about to write %d bytes", len(request.Header))
 	if _, err := conn.Write(request.Header); err != nil {
+		log.Printf("XRootD: writeRequest() failed: %v", err)
 		return err
 	}
+	log.Printf("XRootD: writeRequest() write completed successfully")
 
 	// If TLS handshake was pending, the write above just completed it.
 	// Now we can safely resume consume() to read the encrypted response.
