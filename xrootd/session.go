@@ -47,6 +47,12 @@ type cliSession struct {
 	cancel           context.CancelFunc
 	connMu           sync.RWMutex // protects conn during TLS upgrade
 	conn             net.Conn
+	
+	// TLS upgrade coordination channels
+	pauseReq         chan struct{} // handshake requests consume() to pause
+	pauseAck         chan struct{} // consume() acknowledges it has paused
+	resume           chan struct{} // handshake signals consume() to resume
+	
 	mux              *mux.Mux
 	protocolVersion  int32
 	signRequirements signing.Requirements
@@ -116,6 +122,10 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		sessionID: addr,
 		addr:      addr,
 		maxSubs:   8, // TODO: The value of 8 is just a guess. Change it?
+		// Initialize TLS upgrade coordination channels
+		pauseReq:  make(chan struct{}, 1),
+		pauseAck:  make(chan struct{}, 1),
+		resume:    make(chan struct{}, 1),
 	}
 
 	// Start consume() to read responses - needed for handshake and protocol negotiation
@@ -143,7 +153,28 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		if token != "" || protocolInfo.HasSecurityInfo {
 			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
 
-			// Lock the connection for TLS upgrade to prevent consume() from reading
+			// Request consume() to pause using deterministic channel handshake
+			select {
+			case sess.pauseReq <- struct{}{}:
+				log.Printf("XRootD: Pause request sent to consume()")
+			case <-ctx.Done():
+				sess.Close()
+				return nil, ctx.Err()
+			}
+
+			// Wait for consume() to acknowledge it has paused (with timeout)
+			select {
+			case <-sess.pauseAck:
+				log.Printf("XRootD: Pause acknowledged by consume()")
+			case <-time.After(2 * time.Second):
+				sess.Close()
+				return nil, fmt.Errorf("xrootd: timeout waiting for consume() to pause before TLS upgrade")
+			case <-ctx.Done():
+				sess.Close()
+				return nil, ctx.Err()
+			}
+
+			// Lock the connection exclusively for TLS upgrade
 			sess.connMu.Lock()
 
 			// Create TLS wrapper around existing connection
@@ -152,6 +183,11 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 			// Perform TLS handshake
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				sess.connMu.Unlock()
+				// Resume consume() even on error
+				select {
+				case sess.resume <- struct{}{}:
+				default:
+				}
 				sess.Close()
 				return nil, fmt.Errorf("xrootd: TLS handshake failed: %w", err)
 			}
@@ -159,8 +195,17 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 			// Atomically replace connection with TLS connection
 			sess.conn = tlsConn
 			sess.connMu.Unlock()
-			
+
 			log.Printf("XRootD: TLS upgrade successful, connection encrypted")
+
+			// Resume consume() - it will now read from TLS connection
+			select {
+			case sess.resume <- struct{}{}:
+				log.Printf("XRootD: Resume signal sent to consume()")
+			case <-ctx.Done():
+				sess.Close()
+				return nil, ctx.Err()
+			}
 		}
 	}
 
@@ -276,6 +321,29 @@ func (sess *cliSession) consume() {
 	var resp mux.ServerResponse
 
 	for {
+		// Check for pause request before starting each read
+		select {
+		case <-sess.pauseReq:
+			log.Printf("XRootD: consume() received pause request")
+			// Acknowledge that we've paused (we're not mid-read at this point)
+			select {
+			case sess.pauseAck <- struct{}{}:
+				log.Printf("XRootD: consume() sent pause acknowledgment")
+			default:
+				// Channel already has a value, ignore
+			}
+			// Wait for resume signal
+			select {
+			case <-sess.resume:
+				log.Printf("XRootD: consume() received resume signal")
+				// Continue to normal operation
+			case <-sess.ctx.Done():
+				return
+			}
+		default:
+			// No pause request, proceed normally
+		}
+		
 		select {
 		case <-sess.ctx.Done():
 			// TODO: Should wait for active requests to be completed?
