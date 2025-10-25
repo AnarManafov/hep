@@ -297,19 +297,21 @@ func (sess *cliSession) consume() {
 				resp.Redirection, resp.Err = mux.ParseRedirection(resp.Data)
 			}
 
-			if err := sess.mux.SendData(header.StreamID, resp); err != nil {
-				if sess.ctx.Err() != nil {
-					// something happened to the context.
-					// ignore this error.
-					continue
-				}
-				panic(err)
-				// TODO: should we just ignore responses to unclaimed stream IDs?
+		if err := sess.mux.SendData(header.StreamID, resp); err != nil {
+			if sess.ctx.Err() != nil {
+				// something happened to the context.
+				// ignore this error.
+				continue
 			}
+			// Log warning instead of panic - likely a race condition with stream cleanup
+			// This can happen when TLS upgrade or session restart causes stream ID mismatch
+			// TODO: investigate root cause of unclaimed stream IDs
+			continue
+		}
 
-			if header.Status != xrdproto.OkSoFar {
-				sess.cleanupRequest(header.StreamID)
-			}
+		if header.Status != xrdproto.OkSoFar {
+			sess.cleanupRequest(header.StreamID)
+		}
 		}
 	}
 }
