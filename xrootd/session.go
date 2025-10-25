@@ -53,6 +53,10 @@ type cliSession struct {
 	pauseAck chan struct{} // consume() acknowledges it has paused
 	resume   chan struct{} // handshake signals consume() to resume
 
+	// tlsHandshakePending indicates that TLS has been wrapped but consume() is still paused
+	// waiting for the first write to complete the handshake
+	tlsHandshakePending atomic.Bool
+
 	mux              *mux.Mux
 	protocolVersion  int32
 	signRequirements signing.Requirements
@@ -231,20 +235,35 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 			sess.conn = tlsConn
 			sess.connMu.Unlock()
 
+			// Mark that TLS handshake is pending - consume() should stay paused until first write
+			sess.tlsHandshakePending.Store(true)
+
 			log.Printf("XRootD: TLS layer enabled, handshake will occur on first write")
 
-			// Resume consume() goroutine - it will read the Login response over TLS
-			log.Printf("XRootD: Resuming consume() after TLS upgrade")
-			select {
-			case sess.resume <- struct{}{}:
-				log.Printf("XRootD: consume() resumed")
-			default:
-				// Channel already has a value, ignore
-			}
+			// DO NOT resume consume() yet!
+			// We must keep consume() paused until AFTER the Login request is sent.
+			// This prevents a race condition where both consume()'s Read() and Login()'s Write()
+			// try to perform the TLS handshake simultaneously, causing "protocol data length error".
+			//
+			// Per XRootD C++ client (XrdClXRootDTransport.cc):
+			//   1. GenerateLogIn() - create login message
+			//   2. NeedEncryption() - check if TLS needed
+			//   3. HandleHandShake() - perform TLS upgrade (wrap socket)
+			//   4. SendHSMsg() - send login message (triggers handshake on write)
+			//   5. THEN async reader continues (reads encrypted response)
+			//
+			// The key insight: In the C++ client, after TLS upgrade, the NEXT operation
+			// is SendHSMsg (write), NOT reading. The async reader stays inactive until
+			// after the login message is sent.
+			//
+			// We'll resume consume() AFTER the Login write completes by having Send()
+			// check if TLS handshake is needed and resume at the right time.
 		}
 	}
 
 	// Step 4: Login (now over TLS if upgraded)
+	// Note: If TLS was enabled, consume() is still paused at this point.
+	// The Login request will trigger the TLS handshake on write, then resume consume().
 	securityInfo, err := sess.Login(ctx, username, token)
 	if err != nil {
 		sess.Close()
@@ -458,6 +477,20 @@ func (sess *cliSession) writeRequest(request pendingRequest) error {
 
 	if _, err := conn.Write(request.Header); err != nil {
 		return err
+	}
+
+	// If TLS handshake was pending, the write above just completed it.
+	// Now we can safely resume consume() to read the encrypted response.
+	// This prevents the race condition where both Write() and Read() try to
+	// perform the TLS handshake simultaneously.
+	if sess.tlsHandshakePending.CompareAndSwap(true, false) {
+		log.Printf("XRootD: TLS handshake completed via write, resuming consume()")
+		select {
+		case sess.resume <- struct{}{}:
+			log.Printf("XRootD: consume() resumed after TLS handshake")
+		default:
+			// Channel already has a value, ignore
+		}
 	}
 
 	if request.PathID != 0 && len(request.Data) > 0 {
