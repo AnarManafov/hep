@@ -183,23 +183,56 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		if token != "" || protocolInfo.HasSecurityInfo {
 			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
 
+			// CRITICAL: Pause consume() goroutine before TLS upgrade to prevent race conditions
+			// The consume() goroutine continuously reads from the connection. If we upgrade to TLS
+			// while it's reading, both the main thread (sending Login) and consume() thread will
+			// simultaneously attempt I/O on the new TLS connection, triggering competing handshakes.
+			// Per XRootD protocol (XrdClXRootDTransport.cc:554-571, XrdClAsyncSocketHandler.cc:624-647):
+			//   1. GenerateLogIn() creates the Login message → sets status=LoginSent
+			//   2. NeedEncryption() returns true (status==LoginSent && kXR_tlsLogin)
+			//   3. HandleHandShake() calls DoTlsHandShake() to upgrade socket
+			//   4. SendHSMsg() sends the Login message over the now-TLS-wrapped socket
+			// The C++ client uses event-driven I/O which naturally prevents concurrent socket access.
+			// We must pause consume() to achieve the same synchronization.
+			log.Printf("XRootD: Pausing consume() for TLS upgrade")
+			select {
+			case sess.pauseReq <- struct{}{}:
+				// Wait for consume() to acknowledge it has paused
+				select {
+				case <-sess.pauseAck:
+					log.Printf("XRootD: consume() paused successfully")
+				case <-time.After(5 * time.Second):
+					sess.Close()
+					return nil, fmt.Errorf("timeout waiting for consume() to pause for TLS upgrade")
+				}
+			case <-time.After(5 * time.Second):
+				sess.Close()
+				return nil, fmt.Errorf("timeout sending pause request to consume()")
+			}
+
 			// Lock the connection exclusively for TLS upgrade
 			sess.connMu.Lock()
 
 			// Wrap existing TCP connection with TLS layer
-			// Per XRootD protocol (XrdClXRootDTransport.cc), the TLS handshake happens
-			// implicitly during the first encrypted write (Login request), not explicitly.
-			// The server calls Link->setTLS() and tlsIO.Accept() after sending the Protocol
-			// response, and expects the client to initiate the handshake during the first
-			// TLS write operation. Calling HandshakeContext() here causes timing issues.
+			// The TLS handshake will occur implicitly during the first I/O operation (Login request write).
+			// The server has already called Link->setTLS() and tlsIO.Accept() after sending the Protocol
+			// response, and is now waiting for the client to initiate the TLS handshake.
 			tlsConn := tls.Client(sess.conn, client.tlsConfig)
 
 			// Atomically replace connection with TLS connection
-			// The handshake will occur automatically when Login sends its request
 			sess.conn = tlsConn
 			sess.connMu.Unlock()
 
 			log.Printf("XRootD: TLS layer enabled, handshake will occur on first write")
+
+			// Resume consume() goroutine - it will read the Login response over TLS
+			log.Printf("XRootD: Resuming consume() after TLS upgrade")
+			select {
+			case sess.resume <- struct{}{}:
+				log.Printf("XRootD: consume() resumed")
+			default:
+				// Channel already has a value, ignore
+			}
 		}
 	}
 
