@@ -43,16 +43,16 @@ import (
 // If the connection is successful, the request is sent specifying that socket for the data exchange.
 // Otherwise, a default socket connected to the server is used.
 type cliSession struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	connMu           sync.RWMutex // protects conn during TLS upgrade
-	conn             net.Conn
-	
+	ctx    context.Context
+	cancel context.CancelFunc
+	connMu sync.RWMutex // protects conn during TLS upgrade
+	conn   net.Conn
+
 	// TLS upgrade coordination channels
-	pauseReq         chan struct{} // handshake requests consume() to pause
-	pauseAck         chan struct{} // consume() acknowledges it has paused
-	resume           chan struct{} // handshake signals consume() to resume
-	
+	pauseReq chan struct{} // handshake requests consume() to pause
+	pauseAck chan struct{} // consume() acknowledges it has paused
+	resume   chan struct{} // handshake signals consume() to resume
+
 	mux              *mux.Mux
 	protocolVersion  int32
 	signRequirements signing.Requirements
@@ -123,9 +123,9 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		addr:      addr,
 		maxSubs:   8, // TODO: The value of 8 is just a guess. Change it?
 		// Initialize TLS upgrade coordination channels
-		pauseReq:  make(chan struct{}, 1),
-		pauseAck:  make(chan struct{}, 1),
-		resume:    make(chan struct{}, 1),
+		pauseReq: make(chan struct{}, 1),
+		pauseAck: make(chan struct{}, 1),
+		resume:   make(chan struct{}, 1),
 	}
 
 	// XRootD Client Connection Sequence (based on official XRootD client implementation):
@@ -187,22 +187,19 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 			sess.connMu.Lock()
 
 			// Wrap existing TCP connection with TLS layer
+			// Per XRootD protocol (XrdClXRootDTransport.cc), the TLS handshake happens
+			// implicitly during the first encrypted write (Login request), not explicitly.
+			// The server calls Link->setTLS() and tlsIO.Accept() after sending the Protocol
+			// response, and expects the client to initiate the handshake during the first
+			// TLS write operation. Calling HandshakeContext() here causes timing issues.
 			tlsConn := tls.Client(sess.conn, client.tlsConfig)
 
-			// Perform explicit TLS handshake to establish encryption
-			// This must complete before any further XRootD protocol messages
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				sess.connMu.Unlock()
-				sess.Close()
-				return nil, fmt.Errorf("xrootd: TLS handshake failed: %w", err)
-			}
-
 			// Atomically replace connection with TLS connection
-			// consume() will read from TLS connection on its next iteration
+			// The handshake will occur automatically when Login sends its request
 			sess.conn = tlsConn
 			sess.connMu.Unlock()
 
-			log.Printf("XRootD: TLS handshake successful, connection now encrypted")
+			log.Printf("XRootD: TLS layer enabled, handshake will occur on first write")
 		}
 	}
 
@@ -340,7 +337,7 @@ func (sess *cliSession) consume() {
 		default:
 			// No pause request, proceed normally
 		}
-		
+
 		select {
 		case <-sess.ctx.Done():
 			// TODO: Should wait for active requests to be completed?
@@ -350,7 +347,7 @@ func (sess *cliSession) consume() {
 			sess.connMu.RLock()
 			conn := sess.conn
 			sess.connMu.RUnlock()
-			
+
 			var err error
 			resp.Data, err = xrdproto.ReadResponseWithReuse(conn, headerBytes, &header)
 			if err != nil {
@@ -411,7 +408,7 @@ func (sess *cliSession) writeRequest(request pendingRequest) error {
 	sess.connMu.RLock()
 	conn := sess.conn
 	sess.connMu.RUnlock()
-	
+
 	if _, err := conn.Write(request.Header); err != nil {
 		return err
 	}
