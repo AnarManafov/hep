@@ -51,9 +51,9 @@ func (a *Auth) Request(params []string) (*auth.Request, error) {
 	// Build TokenResp structure
 	// TokenHdr: 8 bytes
 	hdr := make([]byte, 8)
-	copy(hdr[0:3], "ztn")     // id[4] = "ztn\0" (null already present from make)
-	hdr[4] = 0                 // ver = 0
-	hdr[5] = 'T'               // opr = 'T' (IsTkn)
+	copy(hdr[0:3], "ztn") // id[4] = "ztn\0" (null already present from make)
+	hdr[4] = 0            // ver = 0
+	hdr[5] = 'T'          // opr = 'T' (IsTkn)
 	// hdr[6] and hdr[7] are rsvd = 0 (already set by make)
 
 	// Token length (including null terminator)

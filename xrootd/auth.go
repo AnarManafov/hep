@@ -18,7 +18,7 @@ import (
 
 // defaultProviders is the list of authentification providers a xrootd client will use by default.
 var defaultProviders = []auth.Auther{
-	ztn.Default,  // ZTN (bearer token) - try first for modern authentication
+	ztn.Default, // ZTN (bearer token) - try first for modern authentication
 	krb5.Default,
 	unix.Default,
 	host.Default,
