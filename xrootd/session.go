@@ -128,6 +128,36 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		resume:    make(chan struct{}, 1),
 	}
 
+	// XRootD Client Connection Sequence (based on official XRootD client implementation):
+	//
+	// Per XRootD protocol and official client (XrdCl::XRootDTransport and AsyncSocketHandler):
+	//   1. Connect to server via plain TCP
+	//   2. Start async reader (consume() goroutine) to handle XRootD protocol messages
+	//   3. Send initial Handshake request (plain text, over TCP)
+	//   4. Receive Handshake response (plain text, over TCP)
+	//   5. Send Protocol request with kXR_wantTLS flag (plain text, over TCP)
+	//   6. Receive Protocol response - server indicates TLS requirement via kXR_gotoTLS flag (plain text, over TCP)
+	//   7. If server requires TLS (HasSecurityInfo=true or explicit token present):
+	//      a. Wrap the TCP connection with tls.Client() - creates TLS layer over existing socket
+	//      b. Perform explicit TLS handshake via HandshakeContext() - negotiates encryption
+	//      c. Server performs matching TLS upgrade after sending Protocol response (see XrdXrootdProtocol::do_Protocol)
+	//      d. consume() goroutine continues reading, now from TLS-encrypted connection
+	//   8. Send Login request (over TLS if upgraded, plain TCP otherwise)
+	//   9. Continue with authentication and normal operations
+	//
+	// Key insight from XRootD source (src/XrdXrootd/XrdXrootdXeq.cc:do_Protocol):
+	//   The server calls Link->setTLS() immediately after sending Protocol response if wantTLS=true.
+	//   This means both client and server upgrade their sockets to TLS at the same synchronization point.
+	//
+	// Architecture Note:
+	//   Unlike the official XRootD client which uses non-blocking I/O with an event loop,
+	//   this Go implementation uses blocking I/O in a dedicated goroutine (consume()).
+	//   The TLS upgrade works because:
+	//   - After Protocol() returns, consume() has delivered the response via mux and loops back
+	//   - We wrap the connection with TLS before the next Login request
+	//   - The implicit TLS handshake occurs on the first TLS I/O operation (Login write or consume read)
+	//   - Both client and server are synchronized at this point, both expecting TLS
+
 	// Start consume() to read responses - needed for handshake and protocol negotiation
 	// This reads from the plain TCP connection initially
 	go sess.consume()
@@ -149,63 +179,30 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 	// Step 3: Upgrade to TLS if client wants ZTN and server requires/supports it
 	if client.tlsConfig != nil {
 		// Check if we need to upgrade to TLS for security protocols
-		// ZTN protocol REQUIRES TLS per specification
+		// ZTN protocol REQUIRES TLS per specification (see XrdSecProtocolztn.cc:needTLS)
 		if token != "" || protocolInfo.HasSecurityInfo {
 			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
-
-			// Request consume() to pause using deterministic channel handshake
-			select {
-			case sess.pauseReq <- struct{}{}:
-				log.Printf("XRootD: Pause request sent to consume()")
-			case <-ctx.Done():
-				sess.Close()
-				return nil, ctx.Err()
-			}
-
-			// Wait for consume() to acknowledge it has paused (with timeout)
-			select {
-			case <-sess.pauseAck:
-				log.Printf("XRootD: Pause acknowledged by consume()")
-			case <-time.After(2 * time.Second):
-				sess.Close()
-				return nil, fmt.Errorf("xrootd: timeout waiting for consume() to pause before TLS upgrade")
-			case <-ctx.Done():
-				sess.Close()
-				return nil, ctx.Err()
-			}
 
 			// Lock the connection exclusively for TLS upgrade
 			sess.connMu.Lock()
 
-			// Create TLS wrapper around existing connection
+			// Wrap existing TCP connection with TLS layer
 			tlsConn := tls.Client(sess.conn, client.tlsConfig)
 
-			// Perform TLS handshake
+			// Perform explicit TLS handshake to establish encryption
+			// This must complete before any further XRootD protocol messages
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				sess.connMu.Unlock()
-				// Resume consume() even on error
-				select {
-				case sess.resume <- struct{}{}:
-				default:
-				}
 				sess.Close()
 				return nil, fmt.Errorf("xrootd: TLS handshake failed: %w", err)
 			}
 
 			// Atomically replace connection with TLS connection
+			// consume() will read from TLS connection on its next iteration
 			sess.conn = tlsConn
 			sess.connMu.Unlock()
 
-			log.Printf("XRootD: TLS upgrade successful, connection encrypted")
-
-			// Resume consume() - it will now read from TLS connection
-			select {
-			case sess.resume <- struct{}{}:
-				log.Printf("XRootD: Resume signal sent to consume()")
-			case <-ctx.Done():
-				sess.Close()
-				return nil, ctx.Err()
-			}
+			log.Printf("XRootD: TLS handshake successful, connection now encrypted")
 		}
 	}
 
