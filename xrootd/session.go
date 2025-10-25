@@ -117,8 +117,9 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		maxSubs:   8, // TODO: The value of 8 is just a guess. Change it?
 	}
 
-	// NOTE: Do NOT start consume() yet - must wait until after TLS upgrade
-	// to avoid race condition between consume() reading and TLS handshake
+	// Start consume() to read responses - needed for handshake and protocol negotiation
+	// This reads from the plain TCP connection initially
+	go sess.consume()
 
 	// Step 1: Initial handshake over plain TCP
 	if err := sess.handshake(ctx); err != nil {
@@ -141,6 +142,19 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		if token != "" || protocolInfo.HasSecurityInfo {
 			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
 
+			// CRITICAL: Stop consume() before TLS upgrade to avoid race condition
+			// consume() must not read while TLS handshake is negotiating
+			sess.cancel()
+			
+			// Wait a moment for consume() to exit
+			// TODO: use a proper synchronization mechanism (e.g., WaitGroup)
+			time.Sleep(10 * time.Millisecond)
+
+			// Create new context for post-TLS session
+			ctx, cancel = context.WithCancel(context.Background())
+			sess.ctx = ctx
+			sess.cancel = cancel
+
 			// Wrap existing connection with TLS
 			tlsConn := tls.Client(conn, client.tlsConfig)
 
@@ -153,11 +167,11 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 			// Replace plain connection with TLS connection
 			sess.conn = tlsConn
 			log.Printf("XRootD: TLS upgrade successful, connection encrypted")
+			
+			// Restart consume() to read from TLS connection
+			go sess.consume()
 		}
 	}
-
-	// NOW safe to start consume() goroutine after TLS is fully established
-	go sess.consume()
 
 	// Step 4: Login (now over TLS if upgraded)
 	securityInfo, err := sess.Login(ctx, username, token)
