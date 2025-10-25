@@ -60,7 +60,7 @@ const (
 
 // RequestFlags are client capability flags sent in the protocol request.
 // See XRootD protocol specification and XProtocol.hh for details.
-type RequestFlags int32
+type RequestFlags byte
 
 const (
 	// RequestFlagsNone indicates no special capabilities.
@@ -71,6 +71,8 @@ const (
 	AbleTLS RequestFlags = 0x02
 	// WantTLS (kXR_wantTLS = 0x04) indicates client wants to switch to TLS.
 	WantTLS RequestFlags = 0x04
+	// BifReqs (kXR_bifreqs = 0x08) requests bind interface requirements.
+	BifReqs RequestFlags = 0x08
 )
 
 // ExpectType specifies what operation the client will perform next.
@@ -91,36 +93,33 @@ const (
 // Request holds protocol request parameters.
 type Request struct {
 	ClientProtocolVersion int32
-	Options               RequestOptions
-	_                     [10]byte       // Padding (reduced from 11 to 10)
-	Expect                ExpectType     // What operation follows (Login, Bind, TPC)
-	Flags                 RequestFlags   // Client capability flags (kXR_ableTLS, kXR_wantTLS, etc.)
+	Flags                 RequestFlags // Client capability flags (kXR_secreqs, kXR_ableTLS, kXR_wantTLS, kXR_bifreqs)
+	Expect                ExpectType   // What operation follows (Login, Bind, TPC)
+	_                     [10]byte     // Reserved padding
 }
 
 // NewRequest forms a Request according to provided parameters.
 func NewRequest(protocolVersion int32, withSecurityRequirements bool) *Request {
-	var options = RequestOptionsNone
+	var flags RequestFlags = RequestFlagsNone
 	if withSecurityRequirements {
-		options |= ReturnSecurityRequirements
+		flags |= ReturnSecReqs
 	}
-	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Expect: ExpectNone, Flags: RequestFlagsNone}
+	return &Request{ClientProtocolVersion: protocolVersion, Flags: flags, Expect: ExpectNone}
 }
 
 // NewRequestWithTLS forms a Request with TLS capability flags.
 func NewRequestWithTLS(protocolVersion int32, withSecurityRequirements bool, wantTLS bool) *Request {
-	var options = RequestOptionsNone
-	if withSecurityRequirements {
-		options |= ReturnSecurityRequirements
-	}
-
 	// Set TLS capability flags
-	flags := AbleTLS // Always indicate we're TLS capable if this function is called
+	flags := AbleTLS | BifReqs // Indicate we're TLS capable and request bind interface requirements
+	if withSecurityRequirements {
+		flags |= ReturnSecReqs
+	}
 	if wantTLS {
 		flags |= WantTLS // Request immediate TLS upgrade
 	}
 
 	// Set expect to Login since Protocol request is typically followed by Login
-	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Expect: ExpectLogin, Flags: flags}
+	return &Request{ClientProtocolVersion: protocolVersion, Flags: flags, Expect: ExpectLogin}
 }
 
 // ReqID implements xrdproto.Request.ReqID.
@@ -129,20 +128,18 @@ func (req *Request) ReqID() uint16 { return RequestID }
 // MarshalXrd implements xrdproto.Marshaler.
 func (o Request) MarshalXrd(wBuffer *xrdenc.WBuffer) error {
 	wBuffer.WriteI32(o.ClientProtocolVersion)
-	wBuffer.WriteU8(byte(o.Options))
-	wBuffer.Next(10)
+	wBuffer.WriteU8(byte(o.Flags))
 	wBuffer.WriteU8(byte(o.Expect))
-	wBuffer.WriteI32(int32(o.Flags))
+	wBuffer.Next(10)
 	return nil
 }
 
 // UnmarshalXrd implements xrdproto.Unmarshaler.
 func (o *Request) UnmarshalXrd(rBuffer *xrdenc.RBuffer) error {
 	o.ClientProtocolVersion = rBuffer.ReadI32()
-	o.Options = RequestOptions(rBuffer.ReadU8())
-	rBuffer.Skip(10)
+	o.Flags = RequestFlags(rBuffer.ReadU8())
 	o.Expect = ExpectType(rBuffer.ReadU8())
-	o.Flags = RequestFlags(rBuffer.ReadI32())
+	rBuffer.Skip(10)
 	return nil
 }
 
