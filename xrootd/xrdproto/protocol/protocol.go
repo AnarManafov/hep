@@ -127,10 +127,11 @@ func (req *Request) ReqID() uint16 { return RequestID }
 
 // MarshalXrd implements xrdproto.Marshaler.
 func (o Request) MarshalXrd(wBuffer *xrdenc.WBuffer) error {
-	wBuffer.WriteI32(o.ClientProtocolVersion)
-	wBuffer.WriteU8(byte(o.Flags))
-	wBuffer.WriteU8(byte(o.Expect))
-	wBuffer.Next(10)
+	wBuffer.WriteI32(o.ClientProtocolVersion)  // 4 bytes
+	wBuffer.WriteU8(byte(o.Flags))             // 1 byte
+	wBuffer.WriteU8(byte(o.Expect))            // 1 byte
+	wBuffer.Next(10)                            // 10 bytes reserved
+	wBuffer.WriteI32(0)                        // 4 bytes dlen (always 0 for protocol request)
 	return nil
 }
 
@@ -139,7 +140,8 @@ func (o *Request) UnmarshalXrd(rBuffer *xrdenc.RBuffer) error {
 	o.ClientProtocolVersion = rBuffer.ReadI32()
 	o.Flags = RequestFlags(rBuffer.ReadU8())
 	o.Expect = ExpectType(rBuffer.ReadU8())
-	rBuffer.Skip(10)
+	rBuffer.Skip(10)       // reserved
+	rBuffer.Skip(4)        // dlen
 	return nil
 }
 
