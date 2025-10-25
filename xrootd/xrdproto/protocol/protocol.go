@@ -58,12 +58,27 @@ const (
 	ReturnSecurityRequirements RequestOptions = 1
 )
 
+// RequestFlags are client capability flags sent in the protocol request.
+// See XRootD protocol specification and XProtocol.hh for details.
+type RequestFlags int32
+
+const (
+	// RequestFlagsNone indicates no special capabilities.
+	RequestFlagsNone RequestFlags = 0
+	// ReturnSecReqs (kXR_secreqs = 0x01) requests security requirements in response.
+	ReturnSecReqs RequestFlags = 0x01
+	// AbleTLS (kXR_ableTLS = 0x02) indicates client is TLS capable.
+	AbleTLS RequestFlags = 0x02
+	// WantTLS (kXR_wantTLS = 0x04) indicates client wants to switch to TLS.
+	WantTLS RequestFlags = 0x04
+)
+
 // Request holds protocol request parameters.
 type Request struct {
 	ClientProtocolVersion int32
 	Options               RequestOptions
 	_                     [11]byte
-	_                     int32
+	Flags                 RequestFlags // Client capability flags (kXR_ableTLS, kXR_wantTLS, etc.)
 }
 
 // NewRequest forms a Request according to provided parameters.
@@ -72,7 +87,23 @@ func NewRequest(protocolVersion int32, withSecurityRequirements bool) *Request {
 	if withSecurityRequirements {
 		options |= ReturnSecurityRequirements
 	}
-	return &Request{ClientProtocolVersion: protocolVersion, Options: options}
+	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Flags: RequestFlagsNone}
+}
+
+// NewRequestWithTLS forms a Request with TLS capability flags.
+func NewRequestWithTLS(protocolVersion int32, withSecurityRequirements bool, wantTLS bool) *Request {
+	var options = RequestOptionsNone
+	if withSecurityRequirements {
+		options |= ReturnSecurityRequirements
+	}
+	
+	// Set TLS capability flags
+	flags := AbleTLS // Always indicate we're TLS capable if this function is called
+	if wantTLS {
+		flags |= WantTLS // Request immediate TLS upgrade
+	}
+	
+	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Flags: flags}
 }
 
 // ReqID implements xrdproto.Request.ReqID.
@@ -82,7 +113,8 @@ func (req *Request) ReqID() uint16 { return RequestID }
 func (o Request) MarshalXrd(wBuffer *xrdenc.WBuffer) error {
 	wBuffer.WriteI32(o.ClientProtocolVersion)
 	wBuffer.WriteU8(byte(o.Options))
-	wBuffer.Next(15)
+	wBuffer.Next(11)
+	wBuffer.WriteI32(int32(o.Flags))
 	return nil
 }
 
@@ -90,7 +122,8 @@ func (o Request) MarshalXrd(wBuffer *xrdenc.WBuffer) error {
 func (o *Request) UnmarshalXrd(rBuffer *xrdenc.RBuffer) error {
 	o.ClientProtocolVersion = rBuffer.ReadI32()
 	o.Options = RequestOptions(rBuffer.ReadU8())
-	rBuffer.Skip(15)
+	rBuffer.Skip(11)
+	o.Flags = RequestFlags(rBuffer.ReadI32())
 	return nil
 }
 
