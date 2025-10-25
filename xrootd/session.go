@@ -85,12 +85,12 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 	ctx, cancel := context.WithCancel(ctx)
 
 	addr := parseAddr(address)
-	
+
 	// Discover token from environment if TLS is configured and token is empty
 	if token == "" && client.tlsConfig != nil {
 		token = discoverZTNToken()
 	}
-	
+
 	// ALWAYS start with plain TCP connection
 	// TLS will be upgraded after protocol negotiation (XRootD protocol requirement)
 	var d net.Dialer
@@ -99,8 +99,8 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		cancel()
 		return nil, err
 	}
-	
-	log.Printf("XRootD: Connected to %s (TLS enabled: %v, token present: %v)", 
+
+	log.Printf("XRootD: Connected to %s (TLS enabled: %v, token present: %v)",
 		addr, client.tlsConfig != nil, token != "")
 
 	sess := &cliSession{
@@ -117,7 +117,8 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		maxSubs:   8, // TODO: The value of 8 is just a guess. Change it?
 	}
 
-	go sess.consume()
+	// NOTE: Do NOT start consume() yet - must wait until after TLS upgrade
+	// to avoid race condition between consume() reading and TLS handshake
 
 	// Step 1: Initial handshake over plain TCP
 	if err := sess.handshake(ctx); err != nil {
@@ -139,21 +140,24 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		// ZTN protocol REQUIRES TLS per specification
 		if token != "" || protocolInfo.HasSecurityInfo {
 			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
-			
+
 			// Wrap existing connection with TLS
 			tlsConn := tls.Client(conn, client.tlsConfig)
-			
+
 			// Perform TLS handshake
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				sess.Close()
 				return nil, fmt.Errorf("xrootd: TLS handshake failed: %w", err)
 			}
-			
+
 			// Replace plain connection with TLS connection
 			sess.conn = tlsConn
 			log.Printf("XRootD: TLS upgrade successful, connection encrypted")
 		}
 	}
+
+	// NOW safe to start consume() goroutine after TLS is fully established
+	go sess.consume()
 
 	// Step 4: Login (now over TLS if upgraded)
 	securityInfo, err := sess.Login(ctx, username, token)
@@ -297,21 +301,21 @@ func (sess *cliSession) consume() {
 				resp.Redirection, resp.Err = mux.ParseRedirection(resp.Data)
 			}
 
-		if err := sess.mux.SendData(header.StreamID, resp); err != nil {
-			if sess.ctx.Err() != nil {
-				// something happened to the context.
-				// ignore this error.
+			if err := sess.mux.SendData(header.StreamID, resp); err != nil {
+				if sess.ctx.Err() != nil {
+					// something happened to the context.
+					// ignore this error.
+					continue
+				}
+				// Log warning instead of panic - likely a race condition with stream cleanup
+				// This can happen when TLS upgrade or session restart causes stream ID mismatch
+				// TODO: investigate root cause of unclaimed stream IDs
 				continue
 			}
-			// Log warning instead of panic - likely a race condition with stream cleanup
-			// This can happen when TLS upgrade or session restart causes stream ID mismatch
-			// TODO: investigate root cause of unclaimed stream IDs
-			continue
-		}
 
-		if header.Status != xrdproto.OkSoFar {
-			sess.cleanupRequest(header.StreamID)
-		}
+			if header.Status != xrdproto.OkSoFar {
+				sess.cleanupRequest(header.StreamID)
+			}
 		}
 	}
 }
