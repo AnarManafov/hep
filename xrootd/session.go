@@ -180,12 +180,16 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		return nil, err
 	}
 
+	log.Printf("XRootD: Protocol response: HasSecurityInfo=%v, Flags=%v, SecurityVersion=%d, SecurityOptions=%v",
+		protocolInfo.HasSecurityInfo, protocolInfo.Flags, protocolInfo.SecurityVersion, protocolInfo.SecurityOptions)
+
 	// Step 3: Upgrade to TLS if client wants ZTN and server requires/supports it
 	if client.tlsConfig != nil {
 		// Check if we need to upgrade to TLS for security protocols
 		// ZTN protocol REQUIRES TLS per specification (see XrdSecProtocolztn.cc:needTLS)
 		if token != "" || protocolInfo.HasSecurityInfo {
-			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
+			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol (token present: %v, HasSecurityInfo: %v)",
+				token != "", protocolInfo.HasSecurityInfo)
 
 			// CRITICAL: Pause consume() goroutine before TLS upgrade to prevent race conditions
 			// The consume() goroutine continuously reads from the connection. If we upgrade to TLS
