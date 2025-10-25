@@ -45,6 +45,7 @@ import (
 type cliSession struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
+	connMu           sync.RWMutex // protects conn during TLS upgrade
 	conn             net.Conn
 	mux              *mux.Mux
 	protocolVersion  int32
@@ -142,34 +143,24 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		if token != "" || protocolInfo.HasSecurityInfo {
 			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol")
 
-			// CRITICAL: Stop consume() before TLS upgrade to avoid race condition
-			// consume() must not read while TLS handshake is negotiating
-			sess.cancel()
-			
-			// Wait a moment for consume() to exit
-			// TODO: use a proper synchronization mechanism (e.g., WaitGroup)
-			time.Sleep(10 * time.Millisecond)
+			// Lock the connection for TLS upgrade to prevent consume() from reading
+			sess.connMu.Lock()
 
-			// Create new context for post-TLS session
-			ctx, cancel = context.WithCancel(context.Background())
-			sess.ctx = ctx
-			sess.cancel = cancel
-
-			// Wrap existing connection with TLS
-			tlsConn := tls.Client(conn, client.tlsConfig)
+			// Create TLS wrapper around existing connection
+			tlsConn := tls.Client(sess.conn, client.tlsConfig)
 
 			// Perform TLS handshake
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				sess.connMu.Unlock()
 				sess.Close()
 				return nil, fmt.Errorf("xrootd: TLS handshake failed: %w", err)
 			}
 
-			// Replace plain connection with TLS connection
+			// Atomically replace connection with TLS connection
 			sess.conn = tlsConn
-			log.Printf("XRootD: TLS upgrade successful, connection encrypted")
+			sess.connMu.Unlock()
 			
-			// Restart consume() to read from TLS connection
-			go sess.consume()
+			log.Printf("XRootD: TLS upgrade successful, connection encrypted")
 		}
 	}
 
@@ -290,8 +281,13 @@ func (sess *cliSession) consume() {
 			// TODO: Should wait for active requests to be completed?
 			return
 		default:
+			// Use read lock to allow concurrent reads but block during TLS upgrade
+			sess.connMu.RLock()
+			conn := sess.conn
+			sess.connMu.RUnlock()
+			
 			var err error
-			resp.Data, err = xrdproto.ReadResponseWithReuse(sess.conn, headerBytes, &header)
+			resp.Data, err = xrdproto.ReadResponseWithReuse(conn, headerBytes, &header)
 			if err != nil {
 				if sess.ctx.Err() != nil {
 					// something happened to the context.
@@ -346,18 +342,23 @@ func (sess *cliSession) writeRequest(request pendingRequest) error {
 		request.Header = append(request.Header, request.Data...)
 	}
 
-	if _, err := sess.conn.Write(request.Header); err != nil {
+	// Use read lock to allow concurrent writes but block during TLS upgrade
+	sess.connMu.RLock()
+	conn := sess.conn
+	sess.connMu.RUnlock()
+	
+	if _, err := conn.Write(request.Header); err != nil {
 		return err
 	}
 
 	if request.PathID != 0 && len(request.Data) > 0 {
 		sess.subsMu.RLock()
-		conn, ok := sess.subs[request.PathID]
+		subConn, ok := sess.subs[request.PathID]
 		sess.subsMu.RUnlock()
 		if !ok {
 			return fmt.Errorf("xrootd: connection with wrong pathID = %v was requested", request.PathID)
 		}
-		if _, err := conn.conn.Write(request.Data); err != nil {
+		if _, err := subConn.conn.Write(request.Data); err != nil {
 			return err
 		}
 	}
