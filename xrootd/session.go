@@ -194,6 +194,12 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 			//   4. SendHSMsg() sends the Login message over the now-TLS-wrapped socket
 			// The C++ client uses event-driven I/O which naturally prevents concurrent socket access.
 			// We must pause consume() to achieve the same synchronization.
+			
+			// Set a short read deadline to interrupt consume() if it's blocked in Read()
+			// This forces the blocked read to return with a timeout error, allowing consume()
+			// to loop back and check for the pause request
+			sess.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			
 			log.Printf("XRootD: Pausing consume() for TLS upgrade")
 			select {
 			case sess.pauseReq <- struct{}{}:
@@ -201,11 +207,13 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 				select {
 				case <-sess.pauseAck:
 					log.Printf("XRootD: consume() paused successfully")
-				case <-time.After(5 * time.Second):
+					// Clear the read deadline now that consume() is paused
+					sess.conn.SetReadDeadline(time.Time{})
+				case <-time.After(2 * time.Second):
 					sess.Close()
 					return nil, fmt.Errorf("timeout waiting for consume() to pause for TLS upgrade")
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(1 * time.Second):
 				sess.Close()
 				return nil, fmt.Errorf("timeout sending pause request to consume()")
 			}
@@ -384,6 +392,12 @@ func (sess *cliSession) consume() {
 			var err error
 			resp.Data, err = xrdproto.ReadResponseWithReuse(conn, headerBytes, &header)
 			if err != nil {
+				// Check if this is a timeout error from SetReadDeadline during TLS upgrade
+				// If so, loop back to check for pause request
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				
 				if sess.ctx.Err() != nil {
 					// something happened to the context.
 					// ignore this error.
