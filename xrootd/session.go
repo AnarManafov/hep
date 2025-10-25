@@ -180,89 +180,113 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		return nil, err
 	}
 
-	log.Printf("XRootD: Protocol response: HasSecurityInfo=%v, Flags=%v, SecurityVersion=%d, SecurityOptions=%v",
-		protocolInfo.HasSecurityInfo, protocolInfo.Flags, protocolInfo.SecurityVersion, protocolInfo.SecurityOptions)
+	log.Printf("XRootD: Protocol response: HasSecurityInfo=%v, Flags=%v (0x%x), SecurityVersion=%d, SecurityOptions=%v",
+		protocolInfo.HasSecurityInfo, protocolInfo.Flags, uint32(protocolInfo.Flags), protocolInfo.SecurityVersion, protocolInfo.SecurityOptions)
 
-	// Step 3: Upgrade to TLS if client wants ZTN and server requires/supports it
+	// Step 3: Upgrade to TLS if server explicitly requests it via kXR_gotoTLS flag
+	// Per XRootD protocol (XProtocol.hh lines 1181-1186):
+	//   kXR_haveTLS  = 0x80000000  // Server has TLS capability
+	//   kXR_gotoTLS  = 0x40000000  // Server wants client to upgrade to TLS NOW
+	// 
+	// The server sets kXR_gotoTLS in the protocol response when it determines
+	// the client should upgrade based on:
+	//   - Client sent kXR_wantTLS flag in protocol request
+	//   - Server's xrootd.tls configuration (login, session, data, all)
+	//   - Authentication protocol requirements (ZTN requires TLS)
+	const kXR_gotoTLS = 0x40000000
+	const kXR_haveTLS = 0x80000000
+	
+	shouldUpgradeToTLS := false
 	if client.tlsConfig != nil {
-		// Check if we need to upgrade to TLS for security protocols
-		// ZTN protocol REQUIRES TLS per specification (see XrdSecProtocolztn.cc:needTLS)
-		if token != "" || protocolInfo.HasSecurityInfo {
-			log.Printf("XRootD: Upgrading connection to TLS for ZTN protocol (token present: %v, HasSecurityInfo: %v)",
-				token != "", protocolInfo.HasSecurityInfo)
-
-			// CRITICAL: Pause consume() goroutine before TLS upgrade to prevent race conditions
-			// The consume() goroutine continuously reads from the connection. If we upgrade to TLS
-			// while it's reading, both the main thread (sending Login) and consume() thread will
-			// simultaneously attempt I/O on the new TLS connection, triggering competing handshakes.
-			// Per XRootD protocol (XrdClXRootDTransport.cc:554-571, XrdClAsyncSocketHandler.cc:624-647):
-			//   1. GenerateLogIn() creates the Login message → sets status=LoginSent
-			//   2. NeedEncryption() returns true (status==LoginSent && kXR_tlsLogin)
-			//   3. HandleHandShake() calls DoTlsHandShake() to upgrade socket
-			//   4. SendHSMsg() sends the Login message over the now-TLS-wrapped socket
-			// The C++ client uses event-driven I/O which naturally prevents concurrent socket access.
-			// We must pause consume() to achieve the same synchronization.
-			
-			// Set a short read deadline to interrupt consume() if it's blocked in Read()
-			// This forces the blocked read to return with a timeout error, allowing consume()
-			// to loop back and check for the pause request
-			sess.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			
-			log.Printf("XRootD: Pausing consume() for TLS upgrade")
-			select {
-			case sess.pauseReq <- struct{}{}:
-				// Wait for consume() to acknowledge it has paused
-				select {
-				case <-sess.pauseAck:
-					log.Printf("XRootD: consume() paused successfully")
-					// Clear the read deadline now that consume() is paused
-					sess.conn.SetReadDeadline(time.Time{})
-				case <-time.After(2 * time.Second):
-					sess.Close()
-					return nil, fmt.Errorf("timeout waiting for consume() to pause for TLS upgrade")
-				}
-			case <-time.After(1 * time.Second):
-				sess.Close()
-				return nil, fmt.Errorf("timeout sending pause request to consume()")
-			}
-
-			// Lock the connection exclusively for TLS upgrade
-			sess.connMu.Lock()
-
-			// Wrap existing TCP connection with TLS layer
-			// The TLS handshake will occur implicitly during the first I/O operation (Login request write).
-			// The server has already called Link->setTLS() and tlsIO.Accept() after sending the Protocol
-			// response, and is now waiting for the client to initiate the TLS handshake.
-			tlsConn := tls.Client(sess.conn, client.tlsConfig)
-
-			// Atomically replace connection with TLS connection
-			sess.conn = tlsConn
-			sess.connMu.Unlock()
-
-			// Mark that TLS handshake is pending - consume() should stay paused until first write
-			sess.tlsHandshakePending.Store(true)
-
-			log.Printf("XRootD: TLS layer enabled, handshake will occur on first write")
-
-			// DO NOT resume consume() yet!
-			// We must keep consume() paused until AFTER the Login request is sent.
-			// This prevents a race condition where both consume()'s Read() and Login()'s Write()
-			// try to perform the TLS handshake simultaneously, causing "protocol data length error".
-			//
-			// Per XRootD C++ client (XrdClXRootDTransport.cc):
-			//   1. GenerateLogIn() - create login message
-			//   2. NeedEncryption() - check if TLS needed
-			//   3. HandleHandShake() - perform TLS upgrade (wrap socket)
-			//   4. SendHSMsg() - send login message (triggers handshake on write)
-			//   5. THEN async reader continues (reads encrypted response)
-			//
-			// The key insight: In the C++ client, after TLS upgrade, the NEXT operation
-			// is SendHSMsg (write), NOT reading. The async reader stays inactive until
-			// after the login message is sent.
-			//
-			// We'll resume consume() AFTER the Login write completes by having Send()
-			// check if TLS handshake is needed and resume at the right time.
+		// Check if server explicitly requested TLS upgrade
+		if uint32(protocolInfo.Flags) & kXR_gotoTLS != 0 {
+			log.Printf("XRootD: Server requested TLS upgrade via kXR_gotoTLS flag")
+			shouldUpgradeToTLS = true
+		} else if uint32(protocolInfo.Flags) & kXR_haveTLS != 0 {
+			// Server has TLS capability but didn't request immediate upgrade.
+			// This might happen if xrootd.tls is configured for 'session' but not 'login'.
+			// For now, DO NOT upgrade - let the server decide when TLS should be used.
+			log.Printf("XRootD: Server has TLS capability (kXR_haveTLS) but did not request upgrade")
+			log.Printf("XRootD: Proceeding with plain protocol - server will upgrade later if needed")
+		} else {
+			log.Printf("XRootD: Server does not have TLS capability - proceeding with plain protocol")
 		}
+	}
+
+	if shouldUpgradeToTLS {
+		log.Printf("XRootD: Upgrading connection to TLS as requested by server")
+
+		// CRITICAL: Pause consume() goroutine before TLS upgrade to prevent race conditions
+		// The consume() goroutine continuously reads from the connection. If we upgrade to TLS
+		// while it's reading, both the main thread (sending Login) and consume() thread will
+		// simultaneously attempt I/O on the new TLS connection, triggering competing handshakes.
+		// Per XRootD protocol (XrdClXRootDTransport.cc:554-571, XrdClAsyncSocketHandler.cc:624-647):
+		//   1. GenerateLogIn() creates the Login message → sets status=LoginSent
+		//   2. NeedEncryption() returns true (status==LoginSent && kXR_tlsLogin)
+		//   3. HandleHandShake() calls DoTlsHandShake() to upgrade socket
+		//   4. SendHSMsg() sends the Login message over the now-TLS-wrapped socket
+		// The C++ client uses event-driven I/O which naturally prevents concurrent socket access.
+		// We must pause consume() to achieve the same synchronization.
+		
+		// Set a short read deadline to interrupt consume() if it's blocked in Read()
+		// This forces the blocked read to return with a timeout error, allowing consume()
+		// to loop back and check for the pause request
+		sess.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		
+		log.Printf("XRootD: Pausing consume() for TLS upgrade")
+		select {
+		case sess.pauseReq <- struct{}{}:
+			// Wait for consume() to acknowledge it has paused
+			select {
+			case <-sess.pauseAck:
+				log.Printf("XRootD: consume() paused successfully")
+				// Clear the read deadline now that consume() is paused
+				sess.conn.SetReadDeadline(time.Time{})
+			case <-time.After(2 * time.Second):
+				sess.Close()
+				return nil, fmt.Errorf("timeout waiting for consume() to pause for TLS upgrade")
+			}
+		case <-time.After(1 * time.Second):
+			sess.Close()
+			return nil, fmt.Errorf("timeout sending pause request to consume()")
+		}
+
+		// Lock the connection exclusively for TLS upgrade
+		sess.connMu.Lock()
+
+		// Wrap existing TCP connection with TLS layer
+		// The TLS handshake will occur implicitly during the first I/O operation (Login request write).
+		// The server has already called Link->setTLS() and tlsIO.Accept() after sending the Protocol
+		// response, and is now waiting for the client to initiate the TLS handshake.
+		tlsConn := tls.Client(sess.conn, client.tlsConfig)
+
+		// Atomically replace connection with TLS connection
+		sess.conn = tlsConn
+		sess.connMu.Unlock()
+
+		// Mark that TLS handshake is pending - consume() should stay paused until first write
+		sess.tlsHandshakePending.Store(true)
+
+		log.Printf("XRootD: TLS layer enabled, handshake will occur on first write")
+
+		// DO NOT resume consume() yet!
+		// We must keep consume() paused until AFTER the Login request is sent.
+		// This prevents a race condition where both consume()'s Read() and Login()'s Write()
+		// try to perform the TLS handshake simultaneously, causing "protocol data length error".
+		//
+		// Per XRootD C++ client (XrdClXRootDTransport.cc):
+		//   1. GenerateLogIn() - create login message
+		//   2. NeedEncryption() - check if TLS needed
+		//   3. HandleHandShake() - perform TLS upgrade (wrap socket)
+		//   4. SendHSMsg() - send login message (triggers handshake on write)
+		//   5. THEN async reader continues (reads encrypted response)
+		//
+		// The key insight: In the C++ client, after TLS upgrade, the NEXT operation
+		// is SendHSMsg (write), NOT reading. The async reader stays inactive until
+		// after the login message is sent.
+		//
+		// We'll resume consume() AFTER the Login write completes by having Send()
+		// check if TLS handshake is needed and resume at the right time.
 	}
 
 	// Step 4: Login (now over TLS if upgraded)
