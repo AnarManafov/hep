@@ -21,6 +21,7 @@ import (
 	"go-hep.org/x/hep/xrootd/internal/mux"
 	"go-hep.org/x/hep/xrootd/internal/xrdenc"
 	"go-hep.org/x/hep/xrootd/xrdproto"
+	"go-hep.org/x/hep/xrootd/xrdproto/auth/ztn"
 	"go-hep.org/x/hep/xrootd/xrdproto/signing"
 	"go-hep.org/x/hep/xrootd/xrdproto/sigver"
 )
@@ -100,6 +101,13 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 	// Discover token from environment if TLS is configured and token is empty
 	if token == "" && client.tlsConfig != nil {
 		token = discoverZTNToken()
+	}
+
+	// Update ZTN provider with discovered token
+	if token != "" && client.tlsConfig != nil {
+		if ztnAuth, ok := client.auths["ztn"].(*ztn.Auth); ok && ztnAuth != nil {
+			ztnAuth.Token = token
+		}
 	}
 
 	// ALWAYS start with plain TCP connection
@@ -187,7 +195,7 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 	// Per XRootD protocol (XProtocol.hh lines 1181-1186):
 	//   kXR_haveTLS  = 0x80000000  // Server has TLS capability
 	//   kXR_gotoTLS  = 0x40000000  // Server wants client to upgrade to TLS NOW
-	// 
+	//
 	// The server sets kXR_gotoTLS in the protocol response when it determines
 	// the client should upgrade based on:
 	//   - Client sent kXR_wantTLS flag in protocol request
@@ -195,14 +203,14 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 	//   - Authentication protocol requirements (ZTN requires TLS)
 	const kXR_gotoTLS = 0x40000000
 	const kXR_haveTLS = 0x80000000
-	
+
 	shouldUpgradeToTLS := false
 	if client.tlsConfig != nil {
 		// Check if server explicitly requested TLS upgrade
-		if uint32(protocolInfo.Flags) & kXR_gotoTLS != 0 {
+		if uint32(protocolInfo.Flags)&kXR_gotoTLS != 0 {
 			log.Printf("XRootD: Server requested TLS upgrade via kXR_gotoTLS flag")
 			shouldUpgradeToTLS = true
-		} else if uint32(protocolInfo.Flags) & kXR_haveTLS != 0 {
+		} else if uint32(protocolInfo.Flags)&kXR_haveTLS != 0 {
 			// Server has TLS capability but didn't request immediate upgrade.
 			// This might happen if xrootd.tls is configured for 'session' but not 'login'.
 			// For now, DO NOT upgrade - let the server decide when TLS should be used.
@@ -227,12 +235,12 @@ func newSession(ctx context.Context, address, username, token string, client *Cl
 		//   4. SendHSMsg() sends the Login message over the now-TLS-wrapped socket
 		// The C++ client uses event-driven I/O which naturally prevents concurrent socket access.
 		// We must pause consume() to achieve the same synchronization.
-		
+
 		// Set a short read deadline to interrupt consume() if it's blocked in Read()
 		// This forces the blocked read to return with a timeout error, allowing consume()
 		// to loop back and check for the pause request
 		sess.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		
+
 		log.Printf("XRootD: Pausing consume() for TLS upgrade")
 		select {
 		case sess.pauseReq <- struct{}{}:
@@ -446,7 +454,7 @@ func (sess *cliSession) consume() {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				
+
 				if sess.ctx.Err() != nil {
 					// something happened to the context.
 					// ignore this error.

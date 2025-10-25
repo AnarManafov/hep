@@ -15,7 +15,7 @@ import (
 // needed to the specified predefined security level.
 func (sess *cliSession) Protocol(ctx context.Context) (protocol.Response, error) {
 	var resp protocol.Response
-	
+
 	// Use TLS-aware request if client has TLS config
 	var req *protocol.Request
 	if sess.client.tlsConfig != nil {
@@ -24,7 +24,7 @@ func (sess *cliSession) Protocol(ctx context.Context) (protocol.Response, error)
 	} else {
 		req = protocol.NewRequest(sess.protocolVersion, true)
 	}
-	
+
 	_, err := sess.Send(ctx, &resp, req)
 	// TODO: should we react somehow to redirection?
 	return resp, err

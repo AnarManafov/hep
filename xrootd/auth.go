@@ -13,10 +13,12 @@ import (
 	"go-hep.org/x/hep/xrootd/xrdproto/auth/host"
 	"go-hep.org/x/hep/xrootd/xrdproto/auth/krb5"
 	"go-hep.org/x/hep/xrootd/xrdproto/auth/unix"
+	"go-hep.org/x/hep/xrootd/xrdproto/auth/ztn"
 )
 
 // defaultProviders is the list of authentification providers a xrootd client will use by default.
 var defaultProviders = []auth.Auther{
+	ztn.Default,  // ZTN (bearer token) - try first for modern authentication
 	krb5.Default,
 	unix.Default,
 	host.Default,
