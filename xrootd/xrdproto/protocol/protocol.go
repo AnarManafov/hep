@@ -73,12 +73,28 @@ const (
 	WantTLS RequestFlags = 0x04
 )
 
+// ExpectType specifies what operation the client will perform next.
+// See XRootD protocol specification for details.
+type ExpectType byte
+
+const (
+	// ExpectNone indicates no specific expectation.
+	ExpectNone ExpectType = 0
+	// ExpectLogin (kXR_ExpLogin = 0x01) indicates Login request will follow.
+	ExpectLogin ExpectType = 0x01
+	// ExpectBind (kXR_ExpBind = 0x02) indicates Bind request will follow.
+	ExpectBind ExpectType = 0x02
+	// ExpectTPC (kXR_ExpTPC = 0x04) indicates TPC operation will follow.
+	ExpectTPC ExpectType = 0x04
+)
+
 // Request holds protocol request parameters.
 type Request struct {
 	ClientProtocolVersion int32
 	Options               RequestOptions
-	_                     [11]byte
-	Flags                 RequestFlags // Client capability flags (kXR_ableTLS, kXR_wantTLS, etc.)
+	_                     [10]byte       // Padding (reduced from 11 to 10)
+	Expect                ExpectType     // What operation follows (Login, Bind, TPC)
+	Flags                 RequestFlags   // Client capability flags (kXR_ableTLS, kXR_wantTLS, etc.)
 }
 
 // NewRequest forms a Request according to provided parameters.
@@ -87,7 +103,7 @@ func NewRequest(protocolVersion int32, withSecurityRequirements bool) *Request {
 	if withSecurityRequirements {
 		options |= ReturnSecurityRequirements
 	}
-	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Flags: RequestFlagsNone}
+	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Expect: ExpectNone, Flags: RequestFlagsNone}
 }
 
 // NewRequestWithTLS forms a Request with TLS capability flags.
@@ -96,14 +112,15 @@ func NewRequestWithTLS(protocolVersion int32, withSecurityRequirements bool, wan
 	if withSecurityRequirements {
 		options |= ReturnSecurityRequirements
 	}
-	
+
 	// Set TLS capability flags
 	flags := AbleTLS // Always indicate we're TLS capable if this function is called
 	if wantTLS {
 		flags |= WantTLS // Request immediate TLS upgrade
 	}
-	
-	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Flags: flags}
+
+	// Set expect to Login since Protocol request is typically followed by Login
+	return &Request{ClientProtocolVersion: protocolVersion, Options: options, Expect: ExpectLogin, Flags: flags}
 }
 
 // ReqID implements xrdproto.Request.ReqID.
@@ -113,7 +130,8 @@ func (req *Request) ReqID() uint16 { return RequestID }
 func (o Request) MarshalXrd(wBuffer *xrdenc.WBuffer) error {
 	wBuffer.WriteI32(o.ClientProtocolVersion)
 	wBuffer.WriteU8(byte(o.Options))
-	wBuffer.Next(11)
+	wBuffer.Next(10)
+	wBuffer.WriteU8(byte(o.Expect))
 	wBuffer.WriteI32(int32(o.Flags))
 	return nil
 }
@@ -122,7 +140,8 @@ func (o Request) MarshalXrd(wBuffer *xrdenc.WBuffer) error {
 func (o *Request) UnmarshalXrd(rBuffer *xrdenc.RBuffer) error {
 	o.ClientProtocolVersion = rBuffer.ReadI32()
 	o.Options = RequestOptions(rBuffer.ReadU8())
-	rBuffer.Skip(11)
+	rBuffer.Skip(10)
+	o.Expect = ExpectType(rBuffer.ReadU8())
 	o.Flags = RequestFlags(rBuffer.ReadI32())
 	return nil
 }
